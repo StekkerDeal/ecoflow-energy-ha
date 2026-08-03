@@ -1,6 +1,9 @@
 """Select platform for EcoFlow Energy.
 
-Currently used for PowerOcean Work Mode selection (Self-use, AI Schedule).
+Used for PowerOcean and STREAM AC 5000 work mode selection. The two device
+families share the entity key and nothing else: their modes and their wire
+values are unrelated, so each has its own branch.
+
 Implements the same optimistic-lock pattern as switch.py and number.py:
 after a SET, the local state is updated immediately and MQTT updates for
 the same key are ignored for 5 seconds.
@@ -20,11 +23,16 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     DEVICE_TYPE_POWEROCEAN,
+    DEVICE_TYPE_STREAM_AC5000,
     DOMAIN,
     EcoFlowSelectDef,
     POWEROCEAN_SELECTS,
+    STREAMAC5000_SELECTS,
 )
 from .coordinator import EcoFlowDeviceCoordinator
+from .ecoflow.stream_ac5000_commands import (
+    build_work_mode_payload as build_stream_ac5000_work_mode_payload,
+)
 from .entity import raise_set_failed, raise_set_unsupported
 
 _LOGGER = logging.getLogger(__name__)
@@ -130,6 +138,20 @@ class EcoFlowSelect(CoordinatorEntity[EcoFlowDeviceCoordinator], SelectEntity):
             return
 
         if self._definition.key == "work_mode":
+            if self.coordinator.device_type == DEVICE_TYPE_STREAM_AC5000:
+                # A different device family with its own modes, so it does not
+                # share the PowerOcean wire values.
+                payload = build_stream_ac5000_work_mode_payload(
+                    option, self.coordinator.device_sn
+                )
+                ok = await self.coordinator.async_send_proto_set_command(
+                    payload, label="stream_ac5000_work_mode"
+                )
+                if not ok:
+                    raise_set_failed(self.entity_id)
+                self._apply_optimistic_select(option)
+                return
+
             wire_value = WORK_MODE_TO_INT.get(option)
             if wire_value is None:
                 raise_set_unsupported(self.entity_id)
@@ -158,4 +180,6 @@ def _get_select_defs(device_type: str) -> list[EcoFlowSelectDef]:
     """Return select definitions based on device type."""
     if device_type == DEVICE_TYPE_POWEROCEAN:
         return POWEROCEAN_SELECTS
+    if device_type == DEVICE_TYPE_STREAM_AC5000:
+        return STREAMAC5000_SELECTS
     return []

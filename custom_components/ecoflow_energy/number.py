@@ -21,6 +21,7 @@ from .const import (
     DEVICE_TYPE_POWEROCEAN,
     DEVICE_TYPE_SMARTPLUG,
     DEVICE_TYPE_STREAM,
+    DEVICE_TYPE_STREAM_AC5000,
     DOMAIN,
     EcoFlowNumberDef,
     filter_defs_for_serial,
@@ -29,6 +30,7 @@ from .const import (
     SMARTPLUG_NUMBER_COMMANDS,
     SMARTPLUG_NUMBERS,
     STREAM_NUMBERS,
+    STREAMAC5000_NUMBERS,
 )
 from .coordinator import EcoFlowDeviceCoordinator
 from .entity import EcoFlowWriteGateMixin, raise_set_failed, raise_set_unsupported
@@ -36,6 +38,13 @@ from .ecoflow.delta3_commands import (
     build_number_command as build_delta3_number_command,
 )
 from .ecoflow.energy_stream import build_stream_backup_reserve_payload
+from .ecoflow.stream_ac5000_commands import (
+    MINUTES_PER_DAY,
+    TASK_ADD,
+    TASK_UPDATE,
+    build_soc_limits_payload as build_stream_ac5000_soc_limits_payload,
+    build_task_payload as build_stream_ac5000_task_payload,
+)
 from .ecoflow.parsers.smartplug import (
     build_plug_brightness_payload,
     build_plug_max_watts_payload,
@@ -181,6 +190,14 @@ class EcoFlowNumber(
             return
         if self.coordinator.device_type == DEVICE_TYPE_STREAM:
             ok = await self._async_set_stream_value(self._definition.key, value)
+            if not ok:
+                raise_set_failed(self.entity_id)
+            self._apply_optimistic_number(value)
+            return
+        if self.coordinator.device_type == DEVICE_TYPE_STREAM_AC5000:
+            ok = await self._async_set_stream_ac5000_value(
+                self._definition.key, value
+            )
             if not ok:
                 raise_set_failed(self.entity_id)
             self._apply_optimistic_number(value)
@@ -338,6 +355,85 @@ class EcoFlowNumber(
         # wrong thing to tell the user.
         raise_set_unsupported(self.entity_id)
 
+    async def _async_set_stream_ac5000_value(self, key: str, value: float) -> bool:
+        """Set a STREAM AC 5000 number via a 254/38 config write."""
+        device_sn = self.coordinator.device_sn
+        data = self.coordinator.data or {}
+
+        if key in ("max_charge_soc_pct", "min_discharge_soc_pct"):
+            # Config field 29 holds both limits, so the one that is not being
+            # changed has to travel with it at its current value.
+            if key == "max_charge_soc_pct":
+                charge, discharge = int(value), data.get("min_discharge_soc_pct")
+            else:
+                charge, discharge = data.get("max_charge_soc_pct"), int(value)
+            if not isinstance(charge, int) or not isinstance(discharge, int):
+                # Sending a guessed counterpart would change a setting the
+                # user did not touch.
+                raise_set_unsupported(self.entity_id)
+            payload = build_stream_ac5000_soc_limits_payload(
+                charge, discharge, device_sn
+            )
+            return await self.coordinator.async_send_proto_set_command(
+                payload, label="stream_ac5000_soc_limits"
+            )
+
+        if key in ("max_grid_charging_power", "max_discharging_power"):
+            kind = "charge" if key == "max_grid_charging_power" else "discharge"
+            payload = self._build_stream_ac5000_task(kind, int(value), device_sn, data)
+            return await self.coordinator.async_send_proto_set_command(
+                payload, label=f"stream_ac5000_{kind}_power"
+            )
+
+        raise_set_unsupported(self.entity_id)
+
+    def _build_stream_ac5000_task(
+        self, kind: str, power_w: int, device_sn: str, data: dict[str, Any]
+    ) -> bytes:
+        """Build the task frame that carries a power setpoint.
+
+        This device has no direct power setpoint: a scheduled task is the
+        setpoint, so changing the power means rewriting the task. Everything
+        else about that task is read back and carried along, so a power change
+        cannot quietly alter a setting the user made in the app. The target
+        SoC matters most: a charge task set to stop at 80% would otherwise be
+        reset to 100% and charge the battery full.
+
+        With no task to read back, one covering the whole day is added
+        instead, which is the only way a setpoint can mean anything.
+        """
+        start = data.get(f"scheduled_{kind}_start_min")
+        end = data.get(f"scheduled_{kind}_end_min")
+        known = isinstance(start, int) and isinstance(end, int) and start < end
+        if not known:
+            start, end = 0, MINUTES_PER_DAY - 1
+            _LOGGER.debug(
+                "No %s task reported by %s, adding one for the whole day",
+                kind, device_sn[:4],
+            )
+
+        if self.coordinator.data is not None:
+            mode = self.coordinator.data.get("work_mode")
+            if mode is not None and mode != "custom":
+                _LOGGER.warning(
+                    "Setting the %s power on %s while it is in %s mode: a "
+                    "scheduled task is only acted on in custom mode, so the "
+                    "device will accept this and may do nothing with it",
+                    kind, device_sn[:4], mode,
+                )
+
+        soc_target = data.get("scheduled_charge_soc_target")
+        return build_stream_ac5000_task_payload(
+            kind,
+            start,
+            end,
+            power_w,
+            device_sn,
+            enabled=bool(data.get(f"scheduled_{kind}_enabled", True)),
+            operation=TASK_UPDATE if known else TASK_ADD,
+            charge_soc_target=soc_target if isinstance(soc_target, int) else 100,
+        )
+
 
 def _get_number_defs(device_type: str) -> list[EcoFlowNumberDef]:
     """Return number definitions based on device type."""
@@ -351,4 +447,6 @@ def _get_number_defs(device_type: str) -> list[EcoFlowNumberDef]:
         return STREAM_NUMBERS
     if device_type == DEVICE_TYPE_DELTA3:
         return DELTA3_NUMBERS
+    if device_type == DEVICE_TYPE_STREAM_AC5000:
+        return STREAMAC5000_NUMBERS
     return []
