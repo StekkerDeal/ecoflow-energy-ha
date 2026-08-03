@@ -327,13 +327,11 @@ class EcoFlowMQTTClient:
         self.last_disconnect_time = current_time
 
         if was_connected or rc_val != 0:
-            # First disconnect is normal (broker-side rotation) - only warn
-            # if previous reconnect attempts are already pending (sustained failure)
-            if rc_val != 0 and self.reconnect_attempts > 0 and not self._listen_only:
-                _log = _LOGGER.warning
-            else:
-                _log = _LOGGER.debug
-            _log(
+            # Info, not debug: reading it at debug means enabling the
+            # per-message logging in this module, which buries it.
+            level = "warning" if rc_val != 0 and self.reconnect_attempts > 0 else "info"
+            self._log_issue(
+                level,
                 "MQTT disconnect: rc=%s, was_connected=%s, duration=%.1fs, attempts=%d",
                 rc_val, was_connected, duration, self.reconnect_attempts,
             )

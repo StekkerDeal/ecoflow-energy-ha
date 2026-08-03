@@ -532,6 +532,42 @@ class TestOnDisconnect:
         assert client.connected is False
         assert client.last_disconnect_time > 0
 
+    def test_a_clean_disconnect_is_reported_at_info(self, caplog):
+        client = _make_client()
+        client.connected = True
+        client.client = MagicMock()
+
+        with caplog.at_level(logging.INFO):
+            client._on_disconnect(client.client, None, None, 0, None)
+
+        assert "MQTT disconnect: rc=0" in caplog.text
+
+    def test_a_sustained_failure_still_escalates_to_warning(self, caplog):
+        client = _make_client()
+        client.connected = True
+        client.client = MagicMock()
+        client.reconnect_attempts = 3
+
+        with caplog.at_level(logging.INFO):
+            with patch.object(client, "_schedule_reconnect"):
+                client._on_disconnect(client.client, None, None, 7, None)
+
+        assert [r.levelname for r in caplog.records if "MQTT disconnect" in r.message] == [
+            "WARNING"
+        ]
+
+    def test_a_listen_only_link_stays_quiet(self, caplog):
+        """A diagnostics-only link has no entities, so its drops are noise."""
+        client = _make_client()
+        client._listen_only = True
+        client.connected = True
+        client.client = MagicMock()
+
+        with caplog.at_level(logging.INFO):
+            client._on_disconnect(client.client, None, None, 0, None)
+
+        assert "MQTT disconnect" not in caplog.text
+
     def test_on_disconnect_nonzero_rc_schedules_reconnect(self):
         client = _make_client()
         client.connected = True
